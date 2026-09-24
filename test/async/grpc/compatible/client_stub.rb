@@ -202,8 +202,8 @@ describe Async::GRPC::Compatible::ClientStub do
 	
 	it "preserves application decoder errors" do
 		expect do
-			stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("Hello"), CompatibleMessage.method(:encode), ->(payload){raise IOError, "application decoder"})
-		end.to raise_exception(IOError, message: be == "application decoder")
+			stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("Hello"), CompatibleMessage.method(:encode), ->(payload){raise IOError, "Application decoder!"})
+		end.to raise_exception(IOError, message: be == "Application decoder!")
 	end
 	
 	it "connects directly to a target" do
@@ -327,7 +327,7 @@ describe Async::GRPC::Compatible::ClientStub do
 	it "rejects invalid deadlines" do
 		expect do
 			request("Hello", deadline: Object.new)
-		end.to raise_exception(TypeError, message: be =~ /deadline/)
+		end.to raise_exception(TypeError, message: be =~ /Deadline/)
 	end
 	
 	it "rejects expired deadlines before making the request" do
@@ -344,7 +344,7 @@ describe Async::GRPC::Compatible::ClientStub do
 				->(_message){Object.new},
 				CompatibleMessage.method(:decode)
 			)
-		end.to raise_exception(TypeError, message: be =~ /marshal/)
+		end.to raise_exception(TypeError, message: be =~ /Marshal/)
 	end
 	
 	it "translates protocol errors into grpc-ruby errors" do
@@ -386,7 +386,7 @@ describe Async::GRPC::Compatible::ClientStub do
 	it "rejects parent call propagation" do
 		expect do
 			request("Hello", parent: Object.new)
-		end.to raise_exception(NotImplementedError, message: be =~ /parent/)
+		end.to raise_exception(NotImplementedError, message: be =~ /Parent/)
 	end
 	
 	it "rejects per-call credentials" do
@@ -479,7 +479,7 @@ describe Async::GRPC::Compatible::ClientStub do
 		it "rejects native channel overrides" do
 			expect do
 				subject.setup_channel(Object.new, "unused", nil)
-			end.to raise_exception(TypeError, message: be =~ /channel_override/)
+			end.to raise_exception(TypeError, message: be =~ /Channel override/)
 		end
 	end
 	
@@ -508,7 +508,7 @@ describe Async::GRPC::Compatible::ClientStub do
 		it "rejects invalid credentials" do
 			expect do
 				subject.endpoint_for("localhost:50051", nil)
-			end.to raise_exception(TypeError, message: be =~ /credentials/)
+			end.to raise_exception(TypeError, message: be =~ /Credentials/)
 		end
 		
 		it "rejects unsupported target schemes" do

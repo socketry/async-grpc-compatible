@@ -77,7 +77,7 @@ module Async
 					when nil
 						# Continue constructing the channel:
 					else
-						raise TypeError, "channel_override must be an Async::GRPC::Compatible::Channel or Async::GRPC::Client!"
+						raise TypeError, "Channel override must be an Async::GRPC::Compatible::Channel or Async::GRPC::Client!"
 					end
 					
 					endpoint = endpoint_for(host, credentials, channel_arguments)
@@ -90,7 +90,7 @@ module Async
 				# @parameter channel_arguments [Hash] gRPC channel arguments.
 				# @returns [Async::HTTP::Endpoint] The HTTP/2 endpoint.
 				def self.endpoint_for(host, credentials, channel_arguments = {})
-					raise TypeError, "host must be a String!" unless host.is_a?(String)
+					raise TypeError, "Host must be a String!" unless host.is_a?(String)
 					
 					scheme = scheme_for(credentials)
 					target = normalize_target(host)
@@ -114,7 +114,7 @@ module Async
 						return "https"
 					end
 					
-					raise TypeError, "credentials must be GRPC channel credentials or :this_channel_is_insecure!"
+					raise TypeError, "Credentials must be GRPC channel credentials or :this_channel_is_insecure!"
 				end
 				
 				# Normalize a grpc-ruby target into an HTTP authority.
@@ -181,7 +181,7 @@ module Async
 					parent: nil,
 					credentials: nil,
 					metadata: {})
-					raise NotImplementedError, "parent call propagation is not yet supported!" if parent
+					raise NotImplementedError, "Parent call propagation is not yet supported!" if parent
 					
 					timeout = relative_timeout(deadline)
 					call_deadline = timeout && Time.now + timeout
@@ -228,7 +228,7 @@ module Async
 					metadata = normalize_metadata(metadata)
 					[@call_credentials, credentials].compact.each do |updater|
 						updater = updater.updater_proc if updater.respond_to?(:updater_proc)
-						raise TypeError, "call credentials must be callable or expose updater_proc!" unless updater.respond_to?(:call)
+						raise TypeError, "Call credentials must be callable or expose updater_proc!" unless updater.respond_to?(:call)
 						metadata = normalize_metadata(updater.call(metadata) || metadata)
 					end
 					metadata
@@ -237,7 +237,7 @@ module Async
 				def invoke_request_response(method, request, marshal, unmarshal, metadata, timeout, operation)
 					body = Protocol::GRPC::Body::Writable.new
 					payload = marshal.call(request)
-					raise TypeError, "marshal must return a String!" unless payload.is_a?(String)
+					raise TypeError, "Marshal must return a String!" unless payload.is_a?(String)
 					
 					body.write(payload)
 					body.close_write
@@ -331,7 +331,7 @@ module Async
 					elsif deadline.is_a?(Numeric)
 						deadline
 					else
-						raise TypeError, "deadline must be a Time or Numeric value!"
+						raise TypeError, "Deadline must be a Time or Numeric value!"
 					end
 				end
 				
@@ -346,7 +346,7 @@ module Async
 				end
 				
 				def raise_bad_status(status, details, metadata, cause: nil)
-					error = ::GRPC::BadStatus.new_status_exception(status, details || "unknown cause!", metadata)
+					error = ::GRPC::BadStatus.new_status_exception(status, details || "Unknown cause!", metadata)
 					raise error, cause: cause
 				end
 			end
