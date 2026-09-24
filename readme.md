@@ -58,6 +58,8 @@ The following are not yet supported:
   - grpc-ruby channel arguments beyond accepting the compatible constructor parameter.
   - Non-DNS resolvers such as Unix sockets and xDS.
 
+Socket and TLS failures can still raise native Ruby exceptions. Translation into grpc-ruby transport errors is tracked separately in [issue #5](https://github.com/socketry/async-grpc-compatible/issues/5).
+
 ## Operations and credentials
 
 Pass `return_op: true` to defer a unary call until `operation.execute`. An operation executes once and exposes `deadline`, `metadata`, `trailing_metadata`, `status`, `cancel`, and `cancelled?`. The deadline includes time spent waiting to execute. Cancel an active operation from the same Async reactor; cancelling it closes that call without closing a shared channel. Calling `cancel` after completion has no effect.

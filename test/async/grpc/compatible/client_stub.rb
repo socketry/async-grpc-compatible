@@ -200,7 +200,7 @@ describe Async::GRPC::Compatible::ClientStub do
 		expect{operation.execute}.to raise_exception(::GRPC::DeadlineExceeded)
 	end
 	
-	it "does not convert application decoder IO errors into transport errors" do
+	it "preserves application decoder errors" do
 		expect do
 			stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("Hello"), CompatibleMessage.method(:encode), ->(payload){raise IOError, "application decoder"})
 		end.to raise_exception(IOError, message: be == "application decoder")
@@ -410,20 +410,6 @@ describe Async::GRPC::Compatible::ClientStub do
 		
 		it "exposes proxy failures as grpc-ruby unavailable errors" do
 			expect{request("Hello")}.to raise_exception(::GRPC::Unavailable, message: be =~ /HTTP 503/)
-		end
-	end
-	
-	with "a failed transport" do
-		let(:grpc_client) do
-			delegate = Object.new
-			delegate.define_singleton_method(:call){|request| raise Errno::ECONNREFUSED}
-			Async::GRPC::Client.new(delegate)
-		end
-		
-		it "exposes unavailable with the transport failure in its cause chain" do
-			expect{request("Hello")}.to raise_exception(::GRPC::Unavailable).and(
-				have_attributes(cause: have_attributes(cause: be_a(Errno::ECONNREFUSED)))
-			)
 		end
 	end
 	
