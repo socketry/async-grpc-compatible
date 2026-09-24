@@ -8,32 +8,7 @@ The gem depends on `grpc` for service definitions and error types. TLS configura
 
 ## Usage
 
-Select the compatible stub when constructing a generated client:
-
-``` ruby
-require "async/grpc/compatible"
-
-stub_class = Async::GRPC::Compatible::ClientStub
-stub = stub_class.new("grpc.example.com:443", IO::Endpoint::TLS::Configuration.new)
-
-response = stub.request_response(
-	"/example.Service/Get",
-	request,
-	->(message){message.to_proto},
-	Example::Response.method(:decode),
-	metadata: {"authorization" => "Bearer token"}
-)
-```
-
-Applications such as NuevoProtobuf should accept the stub class explicitly rather than replacing the process-wide `GRPC::ClientStub` constant:
-
-``` ruby
-NuevoProtobuf::RPC.configure do |config|
-	config.client_stub_class = Async::GRPC::Compatible::ClientStub
-end
-```
-
-That configuration API is illustrative and will require a corresponding NuevoProtobuf change.
+Please see the [project documentation](https://socketry.github.io/async-grpc-compatible/) for more details.
 
 ## Current Compatibility
 
@@ -191,7 +166,23 @@ NuevoProtobuf 2.5.4 and exercises it against an in-process Async HTTP/2 server.
 
 ## Releases
 
-Please see the [project releases](releases.md) for all releases.
+Please see the [project releases](https://socketry.github.io/async-grpc-compatible/releases/index) for all releases.
+
+### v0.1.0
+
+  - Send `application/grpc` and use shared metadata decoding, including unpadded binary metadata.
+  - Map invalid HTTP responses to grpc-ruby errors, preserving the native `ResponseError` and its buffered response as the cause.
+  - Support deferred unary operations with execution, cancellation, deadline, status, and response metadata access.
+  - Support Ruby authentication callbacks at stub construction and per call, evaluated on each execution with the service's JWT audience and merged into request metadata.
+  - Support custom trust roots and mutual TLS through `IO::Endpoint::TLS::Configuration`. Reject opaque native credentials, conflicting target schemes, and authentication callbacks on plaintext channels.
+  - Map grpc-ruby's TLS constructor arguments with `Compatible::ChannelCredentials.new(root_certificates, private_key, certificate_chain)`, returning an `IO::Endpoint::TLS::Configuration` with custom roots, client certificate chains, and peer verification enabled.
+  - Add `ClientStub.for(service)` and the optional `GapicServiceStub` adapter for generated services and GAPIC clients.
+  - Map transport failures to grpc-ruby errors, preserving the original exception as the cause. Connection, DNS, TLS, and HTTP/2 connection failures become `GRPC::Unavailable`, and HTTP/2 stream resets use gRPC's HTTP/2 status mapping.
+  - Share connections between stubs for the same target and TLS configuration on each thread, like grpc-core's global subchannel pool. Closing a stub leaves shared clients open; use `SharedChannel.close` to close the current thread's shared clients, or set `grpc.use_local_subchannel_pool` for a stub-owned connection pool.
+
+### v0.0.0
+
+  - Initial implementation of an Async-backed `GRPC::ClientStub` compatible unary client.
 
 ## License
 

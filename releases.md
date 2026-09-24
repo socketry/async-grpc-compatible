@@ -1,6 +1,6 @@
 # Releases
 
-## Unreleased
+## v0.1.0
 
   - Send `application/grpc` and use shared metadata decoding, including unpadded binary metadata.
   - Map invalid HTTP responses to grpc-ruby errors, preserving the native `ResponseError` and its buffered response as the cause.
