@@ -27,6 +27,7 @@ end
 
 group :test do
 	gem "gapic-common"
+	gem "googleauth"
 	
 	gem "covered"
 	gem "sus"
@@ -36,6 +37,7 @@ group :test do
 	gem "rubocop-socketry"
 	
 	gem "sus-fixtures-async-http"
+	gem "sus-fixtures-openssl"
 	
 	gem "bake-test"
 	gem "bake-test-external"

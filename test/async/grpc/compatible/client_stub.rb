@@ -9,6 +9,8 @@ require "async/grpc/dispatcher"
 require "async/grpc/service"
 require "base64"
 require "sus/fixtures/async/http"
+require "googleauth"
+require_relative "../../../fixtures/tls"
 
 class CompatibleMessage
 	def self.encode(message)
@@ -122,32 +124,112 @@ describe Async::GRPC::Compatible::ClientStub do
 		expect(request("content-type").value).to be == "application/grpc"
 	end
 	
-	it "updates call credentials each time without modifying caller metadata" do
-		count = 0
-		updater = ->(metadata) do
-			count += 1
-			metadata["authorization"] = "Bearer token-#{count}"
-			metadata
+	with "credentials" do
+		include TLSContext
+		
+		it "updates call credentials each time without modifying caller metadata" do
+			count = 0
+			updater = ->(metadata) do
+				count += 1
+				metadata["authorization"] = "Bearer token-#{count}"
+				metadata
+			end
+			metadata = {"x-test" => "original"}
+			expect(request("auth", credentials: updater, metadata: metadata).value).to be == "Bearer token-1"
+			expect(request("auth", credentials: updater, metadata: metadata).value).to be == "Bearer token-2"
+			expect(metadata).to be == {"x-test" => "original"}
 		end
-		metadata = {"x-test" => "original"}
-		expect(request("auth", credentials: updater, metadata: metadata).value).to be == "Bearer token-1"
-		expect(request("auth", credentials: updater, metadata: metadata).value).to be == "Bearer token-2"
-		expect(metadata).to be == {"x-test" => "original"}
+		
+		it "supports credential objects at construction" do
+			credentials = Object.new
+			credentials.define_singleton_method(:updater_proc){->(metadata){metadata.merge("authorization" => "Bearer constructor")}}
+			credential_stub = subject.new("unused", credentials, channel_override: channel)
+			response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+			expect(response.value).to be == "Bearer constructor"
+		end
+		
+		it "supports an explicit credential updater alongside TLS credentials" do
+			updater = ->(metadata){metadata.merge("authorization" => "Bearer explicit")}
+			credential_stub = subject.new("unused", tls_credentials, channel_override: channel, call_credentials: updater)
+			response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+			expect(response.value).to be == "Bearer explicit"
+		end
+		
+		it "runs credential updaters when an operation executes" do
+			count = 0
+			updater = ->(metadata){count += 1; metadata}
+			operation = request("Hello", credentials: updater, return_op: true)
+			expect(count).to be == 0
+			operation.execute
+			expect(count).to be == 1
+		end
+		
+		it "merges authentication headers without exposing request metadata to the callback" do
+			contexts = []
+			updater = ->(context) do
+				contexts << context
+				{authorization: "Bearer token"}
+			end
+			metadata = {"x-test" => "original"}.freeze
+			
+			expect(request("Hello", credentials: updater, metadata: metadata).value).to be == "Hello:original"
+			expect(contexts).to be == [{jwt_aud_uri: "https://#{client_endpoint.authority}/#{service_name}"}]
+			expect(metadata).to be == {"x-test" => "original"}
+		end
+		
+		it "combines constructor and per-call authentication metadata" do
+			default = ->(context){{"x-test" => "default"}}
+			per_call = ->(context){{"x-test-bin" => "per-call"}}
+			credential_stub = subject.new("unused", nil, channel_override: channel, call_credentials: default)
+			response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("Hello"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode), credentials: per_call)
+			
+			expect(response.value).to be == "Hello:default:per-call"
+		end
+		
+		it "keeps request metadata when a callback returns nil" do
+			expect(request("Hello", credentials: ->(context){nil}, metadata: {"x-test" => "original"}).value).to be == "Hello:original"
+		end
+		
+		it "rejects callback results that are not metadata" do
+			expect(grpc_client).not.to receive(:call)
+			expect{request("Hello", credentials: ->(context){"Bearer token"})}.to raise_exception(TypeError, message: be == "Call credentials must return a Hash or nil!")
+		end
+		
+		it "does not send authentication context as request headers" do
+			headers = nil
+			mock(grpc_client) do |wrapper|
+				wrapper.wrap(:call) do |original, request|
+					headers = request.headers
+					original.call(request)
+				end
+			end
+			
+			expect(request("Hello", credentials: ->(context){context}).value).to be == "Hello"
+			expect(headers["jwt_aud_uri"]).to be_nil
+		end
 	end
 	
-	it "supports credential objects at construction" do
-		credentials = Object.new
-		credentials.define_singleton_method(:updater_proc){->(metadata){metadata.merge("authorization" => "Bearer constructor")}}
-		credential_stub = subject.new("unused", credentials, channel_override: channel)
-		response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
-		expect(response.value).to be == "Bearer constructor"
+	it "rejects call credentials on an insecure channel before invoking them" do
+		called = false
+		updater = ->(context){called = true; {authorization: "Bearer token"}}
+		expect(grpc_client).not.to receive(:call)
+		
+		expect{request("auth", credentials: updater)}.to raise_exception(ArgumentError, message: be =~ /secure channel/)
+		expect(called).to be == false
 	end
 	
-	it "supports an explicit credential updater alongside TLS credentials" do
-		updater = ->(metadata){metadata.merge("authorization" => "Bearer explicit")}
-		credential_stub = subject.new("unused", ::GRPC::Core::ChannelCredentials.new, channel_override: channel, call_credentials: updater)
-		response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
-		expect(response.value).to be == "Bearer explicit"
+	it "rejects call credentials when a shared client's endpoint is unknown" do
+		unknown_channel = Async::GRPC::Compatible::Channel.new(client: Object.new)
+		unknown_stub = subject.new("example.googleapis.com", nil, channel_override: unknown_channel, call_credentials: ->(context){{}})
+		
+		expect do
+			unknown_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("Hello"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+		end.to raise_exception(ArgumentError, message: be =~ /known endpoint/)
+	end
+	
+	it "rejects ambiguous constructor call credentials" do
+		updater = ->(context){{}}
+		expect{subject.new("example.googleapis.com", updater, call_credentials: updater)}.to raise_exception(ArgumentError, message: be == "Supply call credentials only once!")
 	end
 	
 	it "ignores cancellation after completion" do
@@ -156,15 +238,6 @@ describe Async::GRPC::Compatible::ClientStub do
 		operation.cancel
 		expect(operation).not.to be(:cancelled?)
 		expect(operation.status.code).to be == 0
-	end
-	
-	it "runs credential updaters when an operation executes" do
-		count = 0
-		updater = ->(metadata){count += 1; metadata}
-		operation = request("Hello", credentials: updater, return_op: true)
-		expect(count).to be == 0
-		operation.execute
-		expect(count).to be == 1
 	end
 	
 	it "preserves failed operation status and metadata" do
@@ -429,6 +502,8 @@ describe Async::GRPC::Compatible::ClientStub do
 	end
 	
 	with "GAPIC" do
+		include TLSContext
+		
 		let(:updater) {->(metadata){metadata.merge("authorization" => "Bearer gapic")}}
 		let(:gapic) do
 			Async::GRPC::Compatible::GapicServiceStub.new(GeneratedCompatibleService,
@@ -462,6 +537,96 @@ describe Async::GRPC::Compatible::ClientStub do
 					endpoint: "example.googleapis.com", credentials: updater, channel_pool_config: pool, logger: nil)
 			end.to raise_exception(ArgumentError, message: be =~ /shared Async channel/)
 		end
+		
+		with "Google JWT credentials" do
+			let(:updater) do
+				Google::Auth::ServiceAccountJwtHeaderCredentials.new(
+					private_key: key.to_pem,
+					issuer: "unit@example.invalid",
+					project_id: "unit-project"
+				)
+			end
+			
+			it "signs authentication for the actual shared channel's service audience" do
+				response = gapic.call_rpc(:echo, CompatibleMessage.new("auth"))
+				token = response.value.delete_prefix("Bearer ")
+				claims, header = JWT.decode(token, key.public_key, true, algorithm: "RS256", verify_aud: true, aud: "https://#{client_endpoint.authority}/#{service_name}")
+				
+				expect(claims["iss"]).to be == "unit@example.invalid"
+				expect(header["alg"]).to be == "RS256"
+			ensure
+				gapic.close
+			end
+		end
+	end
+	
+	with "TLS" do
+		include TLSContext
+		
+		it "uses custom trust roots for a direct TLS connection" do
+			direct_stub = subject.new(bound_url, tls_credentials)
+			response = direct_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("TLS"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+			
+			expect(response.value).to be == "TLS"
+		ensure
+			direct_stub&.close
+		end
+		
+		it "rejects a server outside the configured trust roots" do
+			direct_stub = subject.new(bound_url, IO::Endpoint::TLS::Configuration.new)
+			
+			expect do
+				direct_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("TLS"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+			end.to raise_exception(OpenSSL::SSL::SSLError, message: be =~ /certificate verify failed/)
+		ensure
+			direct_stub&.close
+		end
+		
+		it "rejects a trusted certificate for the wrong hostname" do
+			wrong_endpoint = subject.endpoint_for("https://wrong.example.invalid", tls_credentials)
+			wrong_endpoint.endpoint = IO::Endpoint.tcp("127.0.0.1", client_endpoint.to_url.port)
+			wrong_channel = Async::GRPC::Compatible::Channel.new(wrong_endpoint)
+			wrong_stub = subject.new("unused", nil, channel_override: wrong_channel)
+			
+			expect do
+				wrong_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("TLS"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+			end.to raise_exception(OpenSSL::SSL::SSLError, message: be =~ /hostname mismatch/)
+		ensure
+			wrong_channel&.close
+		end
+		
+		with "mutual authentication" do
+			def server_tls_configuration
+				IO::Endpoint::TLS::Configuration.new(
+					trust_store: tls_credentials.trust_store,
+					certificate_chain: [certificate.to_pem], private_key: key.to_pem,
+					verification: :required
+				)
+			end
+			
+			it "presents the configured client certificate and private key" do
+				credentials = IO::Endpoint::TLS::Configuration.new(
+					trust_store: tls_credentials.trust_store,
+					certificate_chain: [certificate.to_pem, certificate_authority_certificate.to_pem], private_key: key.to_pem
+				)
+				direct_stub = subject.new(bound_url, credentials)
+				response = direct_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("mTLS"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+				
+				expect(response.value).to be == "mTLS"
+			ensure
+				direct_stub&.close
+			end
+			
+			it "cannot connect without the required client certificate" do
+				direct_stub = subject.new(bound_url, tls_credentials)
+				
+				expect do
+					direct_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("mTLS"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+				end.to raise_exception(StandardError).and(be_a(OpenSSL::SSL::SSLError).or(be_a(EOFError)))
+			ensure
+				direct_stub&.close
+			end
+		end
 	end
 	
 	with ".setup_channel" do
@@ -473,7 +638,7 @@ describe Async::GRPC::Compatible::ClientStub do
 			compatible_channel = subject.setup_channel(grpc_client, "unused", nil)
 			
 			expect(compatible_channel.client).to be == grpc_client
-			expect(compatible_channel.endpoint).to be_nil
+			expect(compatible_channel.endpoint).to be == client_endpoint
 		end
 		
 		it "rejects native channel overrides" do
@@ -498,11 +663,44 @@ describe Async::GRPC::Compatible::ClientStub do
 		end
 		
 		it "constructs a secure HTTP/2 endpoint" do
-			credentials = ::GRPC::Core::ChannelCredentials.new
+			credentials = IO::Endpoint::TLS::Configuration.new
 			endpoint = subject.endpoint_for("grpc.example.com:443", credentials)
 			
 			expect(endpoint.to_url.to_s).to be == "https://grpc.example.com/"
 			expect(endpoint.protocol).to be == Async::HTTP::Protocol::HTTP2
+		end
+		
+		it "verifies certificates and hostnames even on localhost" do
+			endpoint = subject.endpoint_for("localhost:443", IO::Endpoint::TLS::Configuration.new)
+			context = endpoint.endpoint.context
+			
+			expect(context.verify_mode).to be == OpenSSL::SSL::VERIFY_PEER
+			expect(context.verify_hostname).to be == true
+			expect(context.alpn_protocols).to be == ["h2"]
+		end
+		
+		it "rejects plaintext targets with TLS credentials" do
+			expect do
+				subject.endpoint_for("http://example.googleapis.com", IO::Endpoint::TLS::Configuration.new)
+			end.to raise_exception(ArgumentError, message: be =~ /scheme/)
+		end
+		
+		it "rejects TLS targets with insecure credentials" do
+			expect{subject.endpoint_for("https://example.googleapis.com", :this_channel_is_insecure)}.to raise_exception(ArgumentError, message: be =~ /scheme/)
+		end
+		
+		it "rejects opaque native TLS credentials" do
+			expect do
+				subject.new("example.googleapis.com", ::GRPC::Core::ChannelCredentials.new)
+			end.to raise_exception(TypeError, message: be =~ /native gRPC credentials are unsupported/)
+		end
+		
+		it "rejects composed native credentials even when a shared channel is provided" do
+			credentials = ::GRPC::Core::ChannelCredentials.new.compose(::GRPC::Core::CallCredentials.new(->(context){{authorization: "Bearer token"}}))
+			
+			expect do
+				subject.new("example.googleapis.com", credentials, channel_override: channel)
+			end.to raise_exception(TypeError, message: be =~ /native gRPC credentials are unsupported/)
 		end
 		
 		it "rejects invalid credentials" do

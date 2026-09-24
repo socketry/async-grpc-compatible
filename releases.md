@@ -5,7 +5,8 @@
   - Send `application/grpc` and use shared metadata decoding, including unpadded binary metadata.
   - Map invalid HTTP responses to grpc-ruby errors, preserving the native `ResponseError` and its buffered response as the cause.
   - Support deferred unary operations with execution, cancellation, deadline, status, and response metadata access.
-  - Support Ruby credential updaters at stub construction and per call, evaluated on each execution.
+  - Support Ruby authentication callbacks at stub construction and per call, evaluated on each execution with the service's JWT audience and merged into request metadata.
+  - Support custom trust roots and mutual TLS through `IO::Endpoint::TLS::Configuration`. Reject opaque native credentials, conflicting target schemes, and authentication callbacks on plaintext channels.
   - Add `ClientStub.for(service)` and the optional `GapicServiceStub` adapter for generated services and GAPIC clients.
 
 ## v0.0.0

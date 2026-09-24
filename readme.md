@@ -4,7 +4,7 @@ grpc-ruby compatible client interfaces backed by `async-grpc` and `async-http`.
 
 The gem is intended for generated clients which currently construct a `GRPC::ClientStub`, but need to make non-blocking calls inside an Async event loop. Connection reuse and HTTP/2 multiplexing remain the responsibility of `async-http`; this gem does not add a second connection pool.
 
-The initial release still depends on `grpc` for its public credential and error types, but it does not use the native gRPC channel for requests.
+The gem depends on `grpc` for service definitions and error types. TLS configuration comes from `IO::Endpoint`, and requests use Async's connection pool.
 
 ## Usage
 
@@ -14,7 +14,7 @@ Select the compatible stub when constructing a generated client:
 require "async/grpc/compatible"
 
 stub_class = Async::GRPC::Compatible::ClientStub
-stub = stub_class.new("grpc.example.com:443", GRPC::Core::ChannelCredentials.new)
+stub = stub_class.new("grpc.example.com:443", IO::Endpoint::TLS::Configuration.new)
 
 response = stub.request_response(
 	"/example.Service/Get",
@@ -43,7 +43,7 @@ The initial implementation supports:
   - Unary `request_response` calls.
   - Custom marshal and unmarshal callables.
   - Request metadata and deadlines.
-  - Insecure and standard TLS endpoints.
+  - Insecure endpoints and TLS using `IO::Endpoint::TLS::Configuration`, including custom trust roots and client certificates.
   - Translation of gRPC failures into `GRPC::BadStatus` subclasses.
   - Deferred unary operations using `return_op: true`.
   - Ruby credential updaters supplied through `call_credentials:`, `credentials:`, or a credential object with `updater_proc`.
@@ -53,8 +53,8 @@ The following are not yet supported:
 
   - Client, server, or bidirectional streaming.
   - grpc-ruby interceptors.
-  - Parent call propagation and opaque native `GRPC::Core::CallCredentials` objects.
-  - Custom TLS root certificates, client certificates, and native channel overrides.
+  - Parent call propagation.
+  - Native `GRPC::Core::ChannelCredentials`, `GRPC::Core::CallCredentials`, composed credentials, and native channel overrides. These are rejected because their TLS configuration and authentication callbacks cannot be recovered through Ruby's public API.
   - grpc-ruby channel arguments beyond accepting the compatible constructor parameter.
   - Non-DNS resolvers such as Unix sockets and xDS.
 
@@ -66,15 +66,36 @@ Socket and TLS failures can still raise native Ruby exceptions. Translation into
 
 Pass `return_op: true` to defer a unary call until `operation.execute`. An operation executes once and exposes `deadline`, `metadata`, `trailing_metadata`, `status`, `cancel`, and `cancelled?`. The deadline includes time spent waiting to execute. Cancel an active operation from the same Async reactor; cancelling it closes that call without closing a shared channel. Calling `cancel` after completion has no effect.
 
-Supply `call_credentials:` to the constructor for a default updater, or `credentials:` to `request_response` for a per-call updater. An updater receives a copy of the request metadata and may return updated metadata or mutate it and return `nil`. Objects exposing `updater_proc`, such as Google authentication credentials, are also accepted. The updater runs at execution time on every call, so token refreshes are used. Native composed channel credentials are opaque and cannot provide a Ruby token updater.
+Supply `call_credentials:` to the constructor for a default authentication callback, or `credentials:` to `request_response` for a per-call callback. Objects exposing `updater_proc`, such as Google authentication credentials, are also accepted. Callbacks run at execution time on every call, so token refreshes are used.
+
+Each callback receives a fresh authentication context containing `:jwt_aud_uri`, for example `https://grpc.example.com/example.Service`. The audience uses the actual channel's endpoint and RPC service path. Return a hash of authentication headers, or `nil` to add none. Returned headers are merged into a copy of the caller's metadata; per-call credentials run after constructor credentials. The audience context is never sent as a header.
+
+Authentication callbacks require a TLS channel with a known endpoint. A shared `Async::GRPC::Client` supplies its endpoint through its HTTP delegate; for a custom client, supply the endpoint explicitly when constructing `Compatible::Channel.new(endpoint, client: client)`.
 
 ``` ruby
 stub = Async::GRPC::Compatible::ClientStub.new(
 	"grpc.example.com:443",
-	GRPC::Core::ChannelCredentials.new,
+	IO::Endpoint::TLS::Configuration.new,
 	call_credentials: credentials.updater_proc
 )
 ```
+
+Passing an authentication callback as the constructor's second argument creates a default TLS channel with peer and hostname verification. For custom trust roots or mutual TLS, provide the TLS configuration separately:
+
+``` ruby
+tls = IO::Endpoint::TLS::Configuration.new(
+	trust_store: IO::Endpoint::TLS::TrustStore.load("ca.pem"),
+	certificate_chain: IO::Endpoint::TLS::Certificates.parse(File.read("client-chain.pem")),
+	private_key: File.read("client-key.pem")
+)
+
+stub = Async::GRPC::Compatible::ClientStub.new(
+	"grpc.example.com:443", tls,
+	call_credentials: credentials.updater_proc
+)
+```
+
+TLS channels verify peers and hostnames by default, including localhost. An explicit URL must match the selected transport: TLS credentials require `https://`, and `:this_channel_is_insecure` requires `http://`.
 
 ## GAPIC and generated Google clients
 

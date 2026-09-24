@@ -8,6 +8,7 @@ require "async/http/endpoint"
 require "async/http/protocol/http2"
 require "base64"
 require "grpc"
+require "io/endpoint/tls/configuration"
 require "protocol/grpc/body/readable"
 require "protocol/grpc/body/writable"
 require "protocol/grpc/metadata"
@@ -19,10 +20,13 @@ module Async
 			# Represents a reusable Async gRPC channel.
 			class Channel
 				# Initialize a channel for the given endpoint.
-				# @parameter endpoint [Async::HTTP::Endpoint] The remote HTTP/2 endpoint.
+				# @parameter endpoint [Async::HTTP::Endpoint | Nil] The remote HTTP/2 endpoint, inferred from a supplied Async client when possible.
 				# @parameter client [Async::GRPC::Client | Nil] An existing client to use.
 				def initialize(endpoint = nil, client: nil)
 					@endpoint = endpoint
+					if @endpoint.nil? && client.is_a?(Async::GRPC::Client) && client.delegate.respond_to?(:endpoint)
+						@endpoint = client.delegate.endpoint
+					end
 					@client = client || Async::GRPC::Client.open(endpoint)
 					@owned = client.nil?
 				end
@@ -65,7 +69,7 @@ module Async
 				# Construct a compatible channel.
 				# @parameter channel_override [Channel, Async::GRPC::Client | Nil] An existing compatible channel or client.
 				# @parameter host [String] The gRPC target.
-				# @parameter credentials [GRPC::Core::ChannelCredentials, Symbol] The channel credentials.
+				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
 				# @parameter channel_arguments [Hash] gRPC channel arguments.
 				# @returns [Channel] The compatible channel.
 				def self.setup_channel(channel_override, host, credentials, channel_arguments = {})
@@ -86,7 +90,7 @@ module Async
 				
 				# Construct an HTTP/2 endpoint for a gRPC target.
 				# @parameter host [String] The gRPC target.
-				# @parameter credentials [GRPC::Core::ChannelCredentials, Symbol] The channel credentials.
+				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
 				# @parameter channel_arguments [Hash] gRPC channel arguments.
 				# @returns [Async::HTTP::Endpoint] The HTTP/2 endpoint.
 				def self.endpoint_for(host, credentials, channel_arguments = {})
@@ -101,20 +105,31 @@ module Async
 						url = "#{scheme}://#{target}"
 					end
 					
-					Async::HTTP::Endpoint.parse(url, protocol: Async::HTTP::Protocol::HTTP2)
+					if scheme == "https"
+						configuration = IO::Endpoint::TLS::Configuration.new(
+							trust_store: credentials.trust_store,
+							certificate_chain: credentials.certificate_chain,
+							private_key: credentials.private_key,
+							verification: credentials.verification || :peer
+						)
+					end
+					
+					endpoint = Async::HTTP::Endpoint.parse(url, protocol: Async::HTTP::Protocol::HTTP2, tls_configuration: configuration)
+					raise ArgumentError, "Target scheme must match the channel credentials!" unless endpoint.scheme == scheme
+					endpoint
 				end
 				
 				# Determine the URL scheme for the given credentials.
-				# @parameter credentials [GRPC::Core::ChannelCredentials, Symbol] The channel credentials.
+				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
 				# @returns [String] Either `"http"` or `"https"`.
 				def self.scheme_for(credentials)
 					return "http" if credentials == INSECURE_CREDENTIALS
 					
-					if credentials.is_a?(::GRPC::Core::ChannelCredentials)
+					if credentials.is_a?(IO::Endpoint::TLS::Configuration)
 						return "https"
 					end
 					
-					raise TypeError, "Credentials must be GRPC channel credentials or :this_channel_is_insecure!"
+					raise TypeError, "Credentials must be IO::Endpoint::TLS::Configuration or :this_channel_is_insecure; native gRPC credentials are unsupported!"
 				end
 				
 				# Normalize a grpc-ruby target into an HTTP authority.
@@ -134,12 +149,12 @@ module Async
 				
 				# Create a compatible client stub.
 				# @parameter host [String] The gRPC target.
-				# @parameter credentials [GRPC::Core::ChannelCredentials, Symbol, Nil] The channel credentials.
+				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol, Proc, Object, Nil] The channel TLS configuration, insecure marker, or Ruby authentication callback. Callbacks use a default verified TLS channel. Nil requires a channel override.
 				# @parameter channel_override [Channel, Async::GRPC::Client | Nil] An existing compatible channel or client.
 				# @parameter timeout [Numeric | Nil] The default relative timeout in seconds.
 				# @parameter propagate_mask [Integer | Nil] Reserved for grpc-ruby compatibility.
 				# @parameter channel_args [Hash] gRPC channel arguments.
-				# @parameter call_credentials [Proc | Object | Nil] A metadata updater or an object with updater_proc.
+				# @parameter call_credentials [Proc | Object | Nil] An authentication callback or an object with updater_proc.
 				# @parameter interceptors [Array] grpc-ruby client interceptors, which are not yet supported.
 				def initialize(host, credentials,
 					channel_override: nil,
@@ -150,8 +165,13 @@ module Async
 					call_credentials: nil)
 					raise NotImplementedError, "Client interceptors are not yet supported!" unless interceptors.empty?
 					
-					@call_credentials = call_credentials || (credentials if credentials.respond_to?(:updater_proc) || credentials.respond_to?(:call))
-					credentials = ::GRPC::Core::ChannelCredentials.new if @call_credentials.equal?(credentials) && @call_credentials
+					if credentials.respond_to?(:updater_proc) || credentials.respond_to?(:call)
+						raise ArgumentError, "Supply call credentials only once!" if call_credentials
+						call_credentials = credentials
+						credentials = IO::Endpoint::TLS::Configuration.new(verification: :peer)
+					end
+					self.class.scheme_for(credentials) unless credentials.nil? && channel_override
+					@call_credentials = call_credentials
 					channel_arguments = channel_args.dup
 					@channel = self.class.setup_channel(channel_override, host, credentials, channel_arguments)
 					@owned_channel = channel_override.nil?
@@ -207,11 +227,11 @@ module Async
 					Sync do |task|
 						if timeout
 							task.with_timeout(timeout, Async::GRPC::DeadlineExceededError) do
-								metadata = update_metadata(metadata, credentials)
+								metadata = update_metadata(metadata, credentials, method)
 								invoke_request_response(method, request, marshal, unmarshal, metadata, timeout, operation)
 							end
 						else
-							metadata = update_metadata(metadata, credentials)
+							metadata = update_metadata(metadata, credentials, method)
 							invoke_request_response(method, request, marshal, unmarshal, metadata, nil, operation)
 						end
 					end
@@ -224,12 +244,25 @@ module Async
 					raise_bad_status(error.status_code, error.cause&.message || error.message, error.metadata, cause: error)
 				end
 				
-				def update_metadata(metadata, credentials)
+				def update_metadata(metadata, credentials, method)
 					metadata = normalize_metadata(metadata)
 					[@call_credentials, credentials].compact.each do |updater|
 						updater = updater.updater_proc if updater.respond_to?(:updater_proc)
 						raise TypeError, "Call credentials must be callable or expose updater_proc!" unless updater.respond_to?(:call)
-						metadata = normalize_metadata(updater.call(metadata) || metadata)
+						
+						endpoint = @channel.endpoint
+						raise ArgumentError, "Call credentials require a secure channel with a known endpoint!" unless endpoint && endpoint.scheme == "https"
+						service = normalize_method(method).rpartition("/").first
+						context = {jwt_aud_uri: "https://#{endpoint.authority}#{service}"}
+						attributes = updater.call(context)
+						next if attributes.nil?
+						raise TypeError, "Call credentials must return a Hash or nil!" unless attributes.is_a?(Hash)
+						
+						# Google updaters can return the context along with authentication headers.
+						attributes.each do |key, value|
+							key = key.to_s
+							metadata[key] = value unless key == "jwt_aud_uri"
+						end
 					end
 					metadata
 				end
