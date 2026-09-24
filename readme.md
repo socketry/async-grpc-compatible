@@ -43,7 +43,7 @@ The initial implementation supports:
   - Unary `request_response` calls.
   - Custom marshal and unmarshal callables.
   - Request metadata and deadlines.
-  - Insecure endpoints and TLS using `IO::Endpoint::TLS::Configuration`, including custom trust roots and client certificates.
+  - Insecure endpoints and TLS using `Compatible::ChannelCredentials` or `IO::Endpoint::TLS::Configuration`, including custom trust roots and client certificates.
   - Translation of gRPC failures into `GRPC::BadStatus` subclasses.
   - Deferred unary operations using `return_op: true`.
   - Ruby credential updaters supplied through `call_credentials:`, `credentials:`, or a credential object with `updater_proc`.
@@ -96,6 +96,30 @@ stub = Async::GRPC::Compatible::ClientStub.new(
 ```
 
 TLS channels verify peers and hostnames by default, including localhost. An explicit URL must match the selected transport: TLS credentials require `https://`, and `:this_channel_is_insecure` requires `http://`.
+
+### gRPC TLS configuration
+
+`Async::GRPC::Compatible::ChannelCredentials` accepts the same three optional positional PEM arguments as `GRPC::Core::ChannelCredentials.new` and exposes the mapped `IO::Endpoint::TLS::Configuration` through `tls_configuration`:
+
+| gRPC constructor argument | TLS configuration |
+| --- | --- |
+| Root certificates | `trust_store`, containing only the supplied roots |
+| Client private key | `private_key` |
+| Client certificate chain | `certificate_chain`, split into individual certificates in the supplied order |
+
+``` ruby
+tls = Async::GRPC::Compatible::ChannelCredentials.new(
+	File.read("ca.pem"),
+	File.read("client-key.pem"),
+	File.read("client-chain.pem")
+)
+
+stub = Async::GRPC::Compatible::ClientStub.new("grpc.example.com:443", tls)
+```
+
+Use `ChannelCredentials.new` for the transport's default trust store, or `ChannelCredentials.new(root_pem)` for custom roots without a client identity. The client key and certificate chain must be supplied together. Peer and hostname verification are always enabled by this mapping. gRPC-specific default-root overrides are not read; supply those roots explicitly.
+
+Pass these compatible credentials to `ClientStub` or `GapicServiceStub` at construction. Existing native credential objects cannot be converted through Ruby's public API, so retain the PEM inputs at that boundary. Supply Ruby authentication callbacks separately using `call_credentials:` on `ClientStub`.
 
 ## GAPIC and generated Google clients
 

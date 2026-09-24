@@ -563,6 +563,17 @@ describe Async::GRPC::Compatible::ClientStub do
 	with "TLS" do
 		include TLSContext
 		
+		it "maps gRPC root certificates and supports a separate authentication callback" do
+			credentials = Async::GRPC::Compatible::ChannelCredentials.new(certificate_authority_certificate.to_pem)
+			updater = ->(context){{"authorization" => "Bearer mapped"}}
+			direct_stub = subject.new(bound_url, credentials, call_credentials: updater)
+			response = direct_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+			
+			expect(response.value).to be == "Bearer mapped"
+		ensure
+			direct_stub&.close
+		end
+		
 		it "uses custom trust roots for a direct TLS connection" do
 			direct_stub = subject.new(bound_url, tls_credentials)
 			response = direct_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("TLS"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
@@ -602,6 +613,17 @@ describe Async::GRPC::Compatible::ClientStub do
 					certificate_chain: [certificate.to_pem], private_key: key.to_pem,
 					verification: :required
 				)
+			end
+			
+			it "maps gRPC client credentials through GAPIC for mutual TLS" do
+				roots = certificate_authority_certificate.to_pem
+				credentials = Async::GRPC::Compatible::ChannelCredentials.new(roots, key.to_pem, certificate.to_pem + roots)
+				gapic = Async::GRPC::Compatible::GapicServiceStub.new(GeneratedCompatibleService,
+					endpoint: bound_url, credentials: credentials, logger: nil)
+				
+				expect(gapic.call_rpc(:echo, CompatibleMessage.new("mTLS")).value).to be == "mTLS"
+			ensure
+				gapic&.close
 			end
 			
 			it "presents the configured client certificate and private key" do
@@ -677,6 +699,22 @@ describe Async::GRPC::Compatible::ClientStub do
 			expect(context.verify_mode).to be == OpenSSL::SSL::VERIFY_PEER
 			expect(context.verify_hostname).to be == true
 			expect(context.alpn_protocols).to be == ["h2"]
+		end
+		
+		it "verifies peers and hostnames with default compatible channel credentials" do
+			credentials = Async::GRPC::Compatible::ChannelCredentials.new
+			endpoint = subject.endpoint_for("localhost:443", credentials)
+			context = endpoint.endpoint.context
+			
+			expect(endpoint.scheme).to be == "https"
+			expect(context.verify_mode).to be == OpenSSL::SSL::VERIFY_PEER
+			expect(context.verify_hostname).to be == true
+		end
+		
+		it "rejects plaintext targets with compatible channel credentials" do
+			expect do
+				subject.endpoint_for("http://localhost:50051", Async::GRPC::Compatible::ChannelCredentials.new)
+			end.to raise_exception(ArgumentError, message: be =~ /scheme/)
 		end
 		
 		it "rejects plaintext targets with TLS credentials" do
