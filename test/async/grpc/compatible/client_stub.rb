@@ -4,12 +4,17 @@
 # Copyright, 2026, by Samuel Williams.
 
 require "async/grpc/compatible"
+require "async/grpc/compatible/gapic"
 require "async/grpc/dispatcher"
 require "async/grpc/service"
 require "base64"
 require "sus/fixtures/async/http"
 
 class CompatibleMessage
+	def self.encode(message)
+		message.to_proto
+	end
+	
 	def self.decode(payload)
 		new(payload)
 	end
@@ -32,6 +37,14 @@ class CompatibleInterface < Protocol::GRPC::Interface
 		streaming: :unary
 end
 
+class GeneratedCompatibleService
+	include GRPC::GenericService
+	self.service_name = "compatible.Service"
+	self.marshal_class_method = :encode
+	self.unmarshal_class_method = :decode
+	rpc :Echo, CompatibleMessage, CompatibleMessage
+end
+
 class CompatibleService < Async::GRPC::Service
 	def echo(input, output, call)
 		request = input.read
@@ -39,12 +52,16 @@ class CompatibleService < Async::GRPC::Service
 		case request.value
 		when "error"
 			call.response.headers["x-error"] = "metadata"
-			call.response.headers["x-error-bin"] = Base64.strict_encode64("binary metadata")
+			call.response.headers["x-error-bin"] = Base64.strict_encode64("binary metadata").delete("=")
 			Protocol::GRPC::Metadata.assign_status!(
 				call.response.headers,
 				status: Protocol::GRPC::Status::NOT_FOUND,
 				message: "Missing"
 			)
+		when "content-type"
+			output.write(CompatibleMessage.new(call.request.headers["content-type"].to_s))
+		when "auth"
+			output.write(CompatibleMessage.new(call.request.headers["authorization"].to_s))
 		when "slow"
 			sleep(0.1)
 			output.write(CompatibleMessage.new("slow"))
@@ -79,7 +96,7 @@ describe Async::GRPC::Compatible::ClientStub do
 	end
 	
 	it "matches grpc-ruby's constructor call shape" do
-		compatible_parameters = subject.instance_method(:initialize).parameters
+		compatible_parameters = subject.instance_method(:initialize).parameters.reject{|type, name| name == :call_credentials}
 		native_parameters = ::GRPC::ClientStub.instance_method(:initialize).parameters
 		
 		expect(compatible_parameters.map(&:first)).to be == native_parameters.map(&:first)
@@ -99,6 +116,94 @@ describe Async::GRPC::Compatible::ClientStub do
 		
 		expect(response).to be_a(CompatibleMessage)
 		expect(response.value).to be == "Hello"
+	end
+	
+	it "sends the grpc-ruby request content type" do
+		expect(request("content-type").value).to be == "application/grpc"
+	end
+	
+	it "updates call credentials each time without modifying caller metadata" do
+		count = 0
+		updater = ->(metadata) do
+			count += 1
+			metadata["authorization"] = "Bearer token-#{count}"
+			metadata
+		end
+		metadata = {"x-test" => "original"}
+		expect(request("auth", credentials: updater, metadata: metadata).value).to be == "Bearer token-1"
+		expect(request("auth", credentials: updater, metadata: metadata).value).to be == "Bearer token-2"
+		expect(metadata).to be == {"x-test" => "original"}
+	end
+	
+	it "supports credential objects at construction" do
+		credentials = Object.new
+		credentials.define_singleton_method(:updater_proc){->(metadata){metadata.merge("authorization" => "Bearer constructor")}}
+		credential_stub = subject.new("unused", credentials, channel_override: channel)
+		response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+		expect(response.value).to be == "Bearer constructor"
+	end
+	
+	it "supports an explicit credential updater alongside TLS credentials" do
+		updater = ->(metadata){metadata.merge("authorization" => "Bearer explicit")}
+		credential_stub = subject.new("unused", ::GRPC::Core::ChannelCredentials.new, channel_override: channel, call_credentials: updater)
+		response = credential_stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("auth"), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode))
+		expect(response.value).to be == "Bearer explicit"
+	end
+	
+	it "ignores cancellation after completion" do
+		operation = request("Hello", return_op: true)
+		operation.execute
+		operation.cancel
+		expect(operation).not.to be(:cancelled?)
+		expect(operation.status.code).to be == 0
+	end
+	
+	it "runs credential updaters when an operation executes" do
+		count = 0
+		updater = ->(metadata){count += 1; metadata}
+		operation = request("Hello", credentials: updater, return_op: true)
+		expect(count).to be == 0
+		operation.execute
+		expect(count).to be == 1
+	end
+	
+	it "preserves failed operation status and metadata" do
+		operation = request("error", return_op: true)
+		expect{operation.execute}.to raise_exception(::GRPC::NotFound)
+		expect(operation.status.code).to be == 5
+		expect(operation.status.metadata["x-error-bin"]).to be == ["binary metadata"]
+	end
+	
+	it "can cancel an operation before execution" do
+		operation = request("Hello", return_op: true)
+		operation.cancel
+		expect{operation.execute}.to raise_exception(::GRPC::Cancelled)
+		expect(operation).to be(:cancelled?)
+		expect(operation.status.code).to be == 1
+	end
+	
+	it "cancels an active operation without stopping its caller" do
+		operation = request("slow", return_op: true)
+		execution = Async do
+			expect{operation.execute}.to raise_exception(::GRPC::Cancelled)
+			:finished
+		end
+		Async::Task.current.sleep(0.01)
+		operation.cancel
+		expect(execution.wait).to be == :finished
+		expect(operation.status.code).to be == 1
+	end
+	
+	it "counts time spent waiting to execute toward the deadline" do
+		operation = request("Hello", deadline: Time.now + 0.01, return_op: true)
+		Async::Task.current.sleep(0.02)
+		expect{operation.execute}.to raise_exception(::GRPC::DeadlineExceeded)
+	end
+	
+	it "does not convert application decoder IO errors into transport errors" do
+		expect do
+			stub.request_response("/#{service_name}/Echo", CompatibleMessage.new("Hello"), CompatibleMessage.method(:encode), ->(payload){raise IOError, "application decoder"})
+		end.to raise_exception(IOError, message: be == "application decoder")
 	end
 	
 	it "connects directly to a target" do
@@ -270,10 +375,12 @@ describe Async::GRPC::Compatible::ClientStub do
 		end
 	end
 	
-	it "rejects operation objects" do
-		expect do
-			request("Hello", return_op: true)
-		end.to raise_exception(NotImplementedError, message: be =~ /return_op/)
+	it "defers execution until the operation executes" do
+		operation = request("Hello", return_op: true)
+		expect(operation.status).to be_nil
+		expect(operation.execute.value).to be == "Hello"
+		expect(operation.status.code).to be == 0
+		expect{operation.execute}.to raise_exception(RuntimeError, message: be =~ /already/)
 	end
 	
 	it "rejects parent call propagation" do
@@ -285,13 +392,75 @@ describe Async::GRPC::Compatible::ClientStub do
 	it "rejects per-call credentials" do
 		expect do
 			request("Hello", credentials: Object.new)
-		end.to raise_exception(NotImplementedError, message: be =~ /credentials/)
+		end.to raise_exception(TypeError, message: be =~ /credentials/)
 	end
 	
 	it "rejects interceptors" do
 		expect do
 			subject.new("unused", nil, channel_override: channel, interceptors: [Object.new])
 		end.to raise_exception(NotImplementedError, message: be =~ /interceptors/i)
+	end
+	
+	with "a non-gRPC upstream" do
+		let(:app) do
+			Protocol::HTTP::Middleware.for do |request|
+				Protocol::HTTP::Response[503, {"content-type" => "text/html"}, ["<!DOCTYPE html>"]]
+			end
+		end
+		
+		it "exposes proxy failures as grpc-ruby unavailable errors" do
+			expect{request("Hello")}.to raise_exception(::GRPC::Unavailable, message: be =~ /HTTP 503/)
+		end
+	end
+	
+	with "a failed transport" do
+		let(:grpc_client) do
+			delegate = Object.new
+			delegate.define_singleton_method(:call){|request| raise Errno::ECONNREFUSED}
+			Async::GRPC::Client.new(delegate)
+		end
+		
+		it "exposes unavailable with the transport failure in its cause chain" do
+			expect{request("Hello")}.to raise_exception(::GRPC::Unavailable).and(
+				have_attributes(cause: have_attributes(cause: be_a(Errno::ECONNREFUSED)))
+			)
+		end
+	end
+	
+	with "GAPIC" do
+		let(:updater) {->(metadata){metadata.merge("authorization" => "Bearer gapic")}}
+		let(:gapic) do
+			Async::GRPC::Compatible::GapicServiceStub.new(GeneratedCompatibleService,
+				endpoint: "example.googleapis.com", credentials: updater, channel: channel, logger: nil)
+		end
+		
+		it "uses the real GAPIC call path with original credentials and an operation" do
+			yielded = false
+			response = gapic.call_rpc(:echo, CompatibleMessage.new("auth")) do |response, operation|
+				yielded = true
+				expect(response.value).to be == "Bearer gapic"
+				expect(operation.status.code).to be == 0
+				expect(operation.metadata).to be_a(Hash)
+				expect(operation.trailing_metadata).to be_a(Hash)
+			end
+			expect(response.value).to be == "Bearer gapic"
+			expect(yielded).to be == true
+		ensure
+			gapic.close
+		end
+		
+		it "supports the generated service helper directly" do
+			generated = subject.for(GeneratedCompatibleService).new("unused", nil, channel_override: channel)
+			expect(generated.echo(CompatibleMessage.new("generated")).value).to be == "generated"
+		end
+		
+		it "rejects native GAPIC channel pooling" do
+			pool = Struct.new(:channel_count).new(2)
+			expect do
+				Async::GRPC::Compatible::GapicServiceStub.new(GeneratedCompatibleService,
+					endpoint: "example.googleapis.com", credentials: updater, channel_pool_config: pool, logger: nil)
+			end.to raise_exception(ArgumentError, message: be =~ /shared Async channel/)
+		end
 	end
 	
 	with ".setup_channel" do

@@ -7,10 +7,15 @@ source "https://rubygems.org"
 
 gemspec
 
+# Use the shared fixes while their releases are pending:
+gem "protocol-grpc", git: "https://github.com/socketry/protocol-grpc.git", ref: "cb474e449da5864a91206a680c2543e84619ea89"
+
 local_async_grpc_path = File.expand_path("../async-grpc", __dir__)
 
 if File.directory?(local_async_grpc_path)
 	gem "async-grpc", path: local_async_grpc_path
+else
+	gem "async-grpc", git: "https://github.com/socketry/async-grpc.git", ref: "24a57196c8f74d7f12d9fb9cd43132b5ea8930c1"
 end
 
 group :maintenance, optional: true do
@@ -26,6 +31,8 @@ group :maintenance, optional: true do
 end
 
 group :test do
+	gem "gapic-common"
+	
 	gem "covered"
 	gem "sus"
 	

@@ -11,6 +11,7 @@ require "grpc"
 require "protocol/grpc/body/readable"
 require "protocol/grpc/body/writable"
 require "protocol/grpc/metadata"
+require_relative "operation"
 
 module Async
 	module GRPC
@@ -42,6 +43,24 @@ module Async
 			class ClientStub
 				INSECURE_CREDENTIALS = :this_channel_is_insecure
 				DEFAULT_TIMEOUT = nil
+				
+				# Build a compatible stub class for a generated GRPC::GenericService.
+				# @parameter service [Class] The generated service definition.
+				# @returns [Class] A client stub with methods for the service's unary RPCs.
+				def self.for(service)
+					Class.new(self) do
+						service.rpc_descs.each do |name, description|
+							method_name = ::GRPC::GenericService.underscore(name.to_s)
+							path = "/#{service.service_name}/#{name}"
+							marshal = description.marshal_proc
+							unmarshal = description.unmarshal_proc(:output)
+							define_method(method_name) do |request, **options|
+								raise NotImplementedError, "Streaming RPCs are not yet supported" unless description.request_response?
+								request_response(path, request, marshal, unmarshal, **options)
+							end
+						end
+					end
+				end
 				
 				# Construct a compatible channel.
 				# @parameter channel_override [Channel, Async::GRPC::Client | Nil] An existing compatible channel or client.
@@ -120,15 +139,19 @@ module Async
 				# @parameter timeout [Numeric | Nil] The default relative timeout in seconds.
 				# @parameter propagate_mask [Integer | Nil] Reserved for grpc-ruby compatibility.
 				# @parameter channel_args [Hash] gRPC channel arguments.
+				# @parameter call_credentials [Proc | Object | Nil] A metadata updater or an object with updater_proc.
 				# @parameter interceptors [Array] grpc-ruby client interceptors, which are not yet supported.
 				def initialize(host, credentials,
 					channel_override: nil,
 					timeout: nil,
 					propagate_mask: nil,
 					channel_args: {},
-					interceptors: [])
+					interceptors: [],
+					call_credentials: nil)
 					raise NotImplementedError, "Client interceptors are not yet supported" unless interceptors.empty?
 					
+					@call_credentials = call_credentials || (credentials if credentials.respond_to?(:updater_proc) || credentials.respond_to?(:call))
+					credentials = ::GRPC::Core::ChannelCredentials.new if @call_credentials.equal?(credentials) && @call_credentials
 					channel_arguments = channel_args.dup
 					@channel = self.class.setup_channel(channel_override, host, credentials, channel_arguments)
 					@owned_channel = channel_override.nil?
@@ -158,26 +181,16 @@ module Async
 					parent: nil,
 					credentials: nil,
 					metadata: {})
-					raise NotImplementedError, "return_op is not yet supported" if return_op
 					raise NotImplementedError, "parent call propagation is not yet supported" if parent
-					raise NotImplementedError, "per-call credentials are not yet supported" if credentials
 					
 					timeout = relative_timeout(deadline)
-					raise_deadline_exceeded if timeout && timeout <= 0
-					
-					Sync do |task|
-						if timeout
-							task.with_timeout(timeout) do
-								invoke_request_response(method, request, marshal, unmarshal, metadata, timeout)
-							end
-						else
-							invoke_request_response(method, request, marshal, unmarshal, metadata, nil)
-						end
+					call_deadline = timeout && Time.now + timeout
+					operation = Operation.new(deadline: call_deadline) do |operation|
+						execute_request_response(method, request, marshal, unmarshal, metadata, credentials, operation)
 					end
-				rescue Async::TimeoutError
-					raise_deadline_exceeded
-				rescue Protocol::GRPC::Error => error
-					raise_bad_status(error.status_code, error.cause&.message || error.message, error.metadata, cause: error)
+					return operation if return_op
+					
+					operation.execute
 				end
 				
 				# Close a channel created by this stub.
@@ -187,7 +200,38 @@ module Async
 				
 			private
 				
-				def invoke_request_response(method, request, marshal, unmarshal, metadata, timeout)
+				def execute_request_response(method, request, marshal, unmarshal, metadata, credentials, operation)
+					timeout = operation.deadline && operation.deadline - Time.now
+					raise_deadline_exceeded if timeout && timeout <= 0
+					
+					Sync do |task|
+						if timeout
+							task.with_timeout(timeout, Async::GRPC::DeadlineExceededError) do
+								metadata = update_metadata(metadata, credentials)
+								invoke_request_response(method, request, marshal, unmarshal, metadata, timeout, operation)
+							end
+						else
+							metadata = update_metadata(metadata, credentials)
+							invoke_request_response(method, request, marshal, unmarshal, metadata, nil, operation)
+						end
+					end
+				rescue Async::GRPC::DeadlineExceededError
+					raise_deadline_exceeded
+				rescue Protocol::GRPC::Error => error
+					raise_bad_status(error.status_code, error.cause&.message || error.message, error.metadata, cause: error)
+				end
+				
+				def update_metadata(metadata, credentials)
+					metadata = normalize_metadata(metadata)
+					[@call_credentials, credentials].compact.each do |updater|
+						updater = updater.updater_proc if updater.respond_to?(:updater_proc)
+						raise TypeError, "call credentials must be callable or expose updater_proc" unless updater.respond_to?(:call)
+						metadata = normalize_metadata(updater.call(metadata) || metadata)
+					end
+					metadata
+				end
+				
+				def invoke_request_response(method, request, marshal, unmarshal, metadata, timeout, operation)
 					body = Protocol::GRPC::Body::Writable.new
 					payload = marshal.call(request)
 					raise TypeError, "marshal must return a String" unless payload.is_a?(String)
@@ -195,20 +239,30 @@ module Async
 					body.write(payload)
 					body.close_write
 					
+					timeout = operation.deadline && operation.deadline - Time.now
+					raise_deadline_exceeded if timeout && timeout <= 0
+					
 					headers = build_headers(
 						metadata: normalize_metadata(metadata),
 						timeout: timeout,
-						content_type: "application/grpc+proto"
+						content_type: "application/grpc"
 					)
 					request = Protocol::HTTP::Request["POST", normalize_method(method), headers, body]
 					response = @channel.client.call(request)
 					
 					begin
+						operation.metadata = extract_metadata(Protocol::HTTP::Headers.new(response.headers.header.to_a, policy: Protocol::GRPC::HEADER_POLICY))
 						response_encoding = response.headers["grpc-encoding"]
 						response_body = Protocol::GRPC::Body::Readable.wrap(response, encoding: response_encoding)
 						payload = response_body&.read
 						response_body&.finish
 						
+						operation.trailing_metadata = extract_metadata(Protocol::HTTP::Headers.new(response.headers.trailer.to_a, policy: Protocol::GRPC::HEADER_POLICY))
+						operation.status = ::Struct::Status.new(
+							Protocol::GRPC::Metadata.extract_status(response.headers),
+							Protocol::GRPC::Metadata.extract_message(response.headers),
+							operation.trailing_metadata
+						)
 						check_status!(response)
 						
 						payload ? unmarshal.call(payload) : nil
@@ -244,19 +298,7 @@ module Async
 				end
 				
 				def extract_metadata(headers)
-					metadata = {}
-					
-					headers.to_h.each do |key, value|
-						next if key.start_with?("grpc-") || key == "content-type" || key == "te"
-						
-						if key.end_with?("-bin")
-							value = value.map{|item| Base64.strict_decode64(item)}
-						end
-						
-						metadata[key] = value
-					end
-					
-					return metadata
+					Protocol::GRPC::Metadata.extract(headers)
 				end
 				
 				def normalize_method(method)
