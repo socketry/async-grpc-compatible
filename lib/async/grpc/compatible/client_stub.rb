@@ -217,6 +217,9 @@ module Async
 					end
 				rescue Async::GRPC::DeadlineExceededError
 					raise_deadline_exceeded
+				rescue Async::GRPC::ResponseError => error
+					status = Protocol::GRPC::Status.for_http_status(error.response.status)
+					raise_bad_status(status, error.message, {}, cause: error)
 				rescue Protocol::GRPC::Error => error
 					raise_bad_status(error.status_code, error.cause&.message || error.message, error.metadata, cause: error)
 				end

@@ -402,14 +402,25 @@ describe Async::GRPC::Compatible::ClientStub do
 	end
 	
 	with "a non-gRPC upstream" do
+		let(:http_status) {503}
+		
 		let(:app) do
 			Protocol::HTTP::Middleware.for do |request|
-				Protocol::HTTP::Response[503, {"content-type" => "text/html"}, ["<!DOCTYPE html>"]]
+				Protocol::HTTP::Response[http_status, {"content-type" => "text/html", "x-request-id" => "123"}, ["<html>", "Proxy failure!", "</html>"]]
 			end
 		end
 		
-		it "exposes proxy failures as grpc-ruby unavailable errors" do
-			expect{request("Hello")}.to raise_exception(::GRPC::Unavailable, message: be =~ /HTTP 503/)
+		{400 => 13, 401 => 16, 403 => 7, 404 => 12, 429 => 14, 502 => 14, 503 => 14, 504 => 14, 500 => 2, 200 => 2}.each do |http, grpc|
+			with "HTTP #{http}", http_status: http do
+				it "maps the status and preserves the response diagnostics" do
+					expect{request("Hello")}.to raise_exception(::GRPC::BadStatus, message: be(:include?, "<html>Proxy failure!</html>")).and(have_attributes(
+						code: be == grpc,
+						cause: be_a(Async::GRPC::ResponseError).and(have_attributes(
+							response: have_attributes(status: be == http, headers: have_keys("x-request-id" => be == ["123"]), body: be_nil)
+						))
+					))
+				end
+			end
 		end
 	end
 	
