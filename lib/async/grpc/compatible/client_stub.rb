@@ -16,6 +16,8 @@ require "protocol/grpc/metadata"
 require_relative "channel_credentials"
 require_relative "operation"
 
+::Thread.attr_accessor :async_grpc_compatible_shared_clients
+
 module Async
 	module GRPC
 		module Compatible
@@ -45,9 +47,50 @@ module Async
 				end
 			end
 			
+			# Represents a channel whose client is shared with other shared channels for the same URL and TLS configuration on the same thread.
+			#
+			# Each thread has its own client because an Async connection pool belongs to a single reactor.
+			class SharedChannel < Channel
+				# @returns [Hash] The current thread's shared clients, keyed by URL and TLS configuration.
+				def self.clients
+					::Thread.current.async_grpc_compatible_shared_clients ||= {}
+				end
+				
+				# Close the current thread's shared clients. Shared channels open new clients on their next call.
+				def self.close
+					# Detach the clients before closing them, since closing may yield to a call which opens a new client:
+					clients = ::Thread.current.async_grpc_compatible_shared_clients
+					::Thread.current.async_grpc_compatible_shared_clients = nil
+					
+					clients&.each_value(&:close)
+				end
+				
+				# Initialize a shared channel for the given URL and TLS configuration.
+				#
+				# The channel freezes a copy of the TLS configuration, so later changes by the caller do not affect shared clients.
+				#
+				# @parameter url [String] The remote `http` or `https` URL.
+				# @parameter tls_configuration [IO::Endpoint::TLS::Configuration | Nil] The TLS configuration for an `https` URL.
+				def initialize(url, tls_configuration = nil)
+					tls_configuration = tls_configuration&.dup&.freeze
+					@endpoint = Async::HTTP::Endpoint.parse(url, protocol: Async::HTTP::Protocol::HTTP2, tls_configuration: tls_configuration)
+					@key = ["#{@endpoint.scheme}://#{@endpoint.authority}", tls_configuration]
+				end
+				
+				# @attribute [Async::GRPC::Client] The current thread's client for this endpoint.
+				def client
+					self.class.clients[@key] ||= Async::GRPC::Client.open(@endpoint)
+				end
+				
+				# Leave the shared client open for other channels.
+				def close
+				end
+			end
+			
 			# Represents a subset of `GRPC::ClientStub` backed by {Async::GRPC::Client}.
 			class ClientStub
 				INSECURE_CREDENTIALS = :this_channel_is_insecure
+				LOCAL_SUBCHANNEL_POOL = "grpc.use_local_subchannel_pool"
 				DEFAULT_TIMEOUT = nil
 				
 				# Transport failures which end a call without a gRPC status. grpc-ruby reports these as `UNAVAILABLE`.
@@ -88,6 +131,9 @@ module Async
 				end
 				
 				# Construct a compatible channel.
+				#
+				# Without an override, the channel shares connections with other stubs for the same target and TLS configuration on the current thread. Set the `grpc.use_local_subchannel_pool` channel argument to a non-zero value to use a client owned by this channel instead.
+				#
 				# @parameter channel_override [Channel, Async::GRPC::Client | Nil] An existing compatible channel or client.
 				# @parameter host [String] The gRPC target.
 				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
@@ -105,16 +151,35 @@ module Async
 						raise TypeError, "Channel override must be an Async::GRPC::Compatible::Channel or Async::GRPC::Client!"
 					end
 					
-					endpoint = endpoint_for(host, credentials, channel_arguments)
-					Channel.new(endpoint)
+					# grpc-ruby accepts string and symbol keys. Only fall back on nil, so an explicit false is preserved:
+					local_pool = channel_arguments[LOCAL_SUBCHANNEL_POOL]
+					local_pool = channel_arguments[LOCAL_SUBCHANNEL_POOL.to_sym] if local_pool.nil?
+					
+					# gRPC uses integer boolean flags (0/1). Ruby treats 0 as truthy, so check it explicitly:
+					if local_pool && local_pool != 0
+						Channel.new(endpoint_for(host, credentials, channel_arguments))
+					else
+						SharedChannel.new(url_for(host, credentials), tls_configuration_for(credentials))
+					end
 				end
 				
 				# Construct an HTTP/2 endpoint for a gRPC target.
+				#
+				# Channels with a local subchannel pool use this endpoint. Shared channels are identified by their URL and TLS configuration, so they are constructed from {url_for} and {tls_configuration_for} instead.
+				#
 				# @parameter host [String] The gRPC target.
 				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
 				# @parameter channel_arguments [Hash] gRPC channel arguments.
 				# @returns [Async::HTTP::Endpoint] The HTTP/2 endpoint.
 				def self.endpoint_for(host, credentials, channel_arguments = {})
+					Async::HTTP::Endpoint.parse(url_for(host, credentials), protocol: Async::HTTP::Protocol::HTTP2, tls_configuration: tls_configuration_for(credentials))
+				end
+				
+				# Construct the URL for a gRPC target.
+				# @parameter host [String] The gRPC target.
+				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
+				# @returns [String] The `http` or `https` URL.
+				def self.url_for(host, credentials)
 					raise TypeError, "Host must be a String!" unless host.is_a?(String)
 					
 					scheme = scheme_for(credentials)
@@ -126,18 +191,23 @@ module Async
 						url = "#{scheme}://#{target}"
 					end
 					
-					if scheme == "https"
-						configuration = IO::Endpoint::TLS::Configuration.new(
-							trust_store: credentials.trust_store,
-							certificate_chain: credentials.certificate_chain,
-							private_key: credentials.private_key,
-							verification: credentials.verification || :peer
-						)
-					end
+					raise ArgumentError, "Target scheme must match the channel credentials!" unless url.start_with?("#{scheme}://")
 					
-					endpoint = Async::HTTP::Endpoint.parse(url, protocol: Async::HTTP::Protocol::HTTP2, tls_configuration: configuration)
-					raise ArgumentError, "Target scheme must match the channel credentials!" unless endpoint.scheme == scheme
-					endpoint
+					return url
+				end
+				
+				# Construct the TLS configuration for the given credentials.
+				# @parameter credentials [IO::Endpoint::TLS::Configuration, Symbol] The channel TLS configuration or insecure marker.
+				# @returns [IO::Endpoint::TLS::Configuration | Nil] The TLS configuration, or `nil` for insecure credentials.
+				def self.tls_configuration_for(credentials)
+					return nil if scheme_for(credentials) == "http"
+					
+					IO::Endpoint::TLS::Configuration.new(
+						trust_store: credentials.trust_store,
+						certificate_chain: credentials.certificate_chain,
+						private_key: credentials.private_key,
+						verification: credentials.verification || :peer
+					)
 				end
 				
 				# Determine the URL scheme for the given credentials.
@@ -234,7 +304,7 @@ module Async
 					operation.execute
 				end
 				
-				# Close a channel created by this stub.
+				# Close a channel created by this stub. Shared clients remain open for other stubs.
 				def close
 					@channel.close if @owned_channel
 				end

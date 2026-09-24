@@ -39,7 +39,7 @@ module Async
 					raise ArgumentError, "Use a shared Async channel instead of a GAPIC channel pool!"
 				end
 				
-				# Close the underlying stub's owned connection pool.
+				# Close the underlying stub's owned connection pool, leaving shared clients open.
 				def close
 					@grpc_stub&.close
 				end

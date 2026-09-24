@@ -32,9 +32,16 @@ describe Async::GRPC::Compatible::GapicServiceStub do
 		stub.close
 	end
 	
-	it "closes the client when it owns the channel" do
-		owned_stub = subject.new(service, endpoint: "example.googleapis.com", credentials: credentials, logger: nil)
-		expect(owned_stub.grpc_stub.channel.endpoint.to_url.to_s).to be == "https://example.googleapis.com/"
+	it "leaves the default shared client open when closed" do
+		shared_stub = subject.new(service, endpoint: "example.googleapis.com", credentials: credentials, logger: nil)
+		expect(shared_stub.grpc_stub.channel.endpoint.to_url.to_s).to be == "https://example.googleapis.com/"
+		expect(shared_stub.grpc_stub.channel.client).not.to receive(:close)
+		
+		shared_stub.close
+	end
+	
+	it "closes the client when it uses a local subchannel pool" do
+		owned_stub = subject.new(service, endpoint: "example.googleapis.com", credentials: credentials, channel_args: {"grpc.use_local_subchannel_pool" => 1}, logger: nil)
 		expect(owned_stub.grpc_stub.channel.client).to receive(:close)
 		
 		owned_stub.close

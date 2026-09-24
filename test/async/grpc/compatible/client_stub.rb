@@ -293,6 +293,189 @@ describe Async::GRPC::Compatible::ClientStub do
 		direct_stub&.close
 	end
 	
+	with "shared channels" do
+		def echo(stub, value)
+			stub.request_response("/#{service_name}/Echo", CompatibleMessage.new(value), CompatibleMessage.method(:encode), CompatibleMessage.method(:decode)).value
+		end
+		
+		it "applies an endpoint override with a local subchannel pool" do
+			port = URI(bound_url).port
+			mapped_class = Class.new(subject) do
+				define_singleton_method(:endpoint_for) do |host, credentials, channel_arguments = {}|
+					endpoint = super(host, credentials, channel_arguments)
+					endpoint.endpoint = IO::Endpoint.tcp("127.0.0.1", port)
+					endpoint
+				end
+			end
+			mapped = mapped_class.new("127.0.0.1:1", :this_channel_is_insecure, channel_args: {"grpc.use_local_subchannel_pool" => 1})
+			
+			expect(echo(mapped, "mapped")).to be == "mapped"
+		ensure
+			mapped&.close
+		end
+		
+		it "validates the target scheme" do
+			expect{subject.new("http://example.com", IO::Endpoint::TLS::Configuration.new)}.to raise_exception(ArgumentError, message: be =~ /scheme/)
+		end
+		
+		it "is unaffected by later changes to its URL" do
+			url = bound_url.dup
+			channel = Async::GRPC::Compatible::SharedChannel.new(url)
+			client = channel.client
+			
+			url.replace("http://other.invalid:1")
+			
+			expect(channel.client).to be_equal(client)
+			expect(subject.new(bound_url, :this_channel_is_insecure).channel.client).to be_equal(client)
+			expect(echo(subject.new("unused", nil, channel_override: channel), "unchanged")).to be == "unchanged"
+		end
+		
+		it "shares one connection between stubs for the same target" do
+			first = subject.new(bound_url, :this_channel_is_insecure)
+			second = subject.new(bound_url, :this_channel_is_insecure)
+			
+			expect(first.channel).to be_a(Async::GRPC::Compatible::SharedChannel)
+			expect(second.channel.client).to be_equal(first.channel.client)
+			expect(echo(first, "first")).to be == "first"
+			expect(echo(second, "second")).to be == "second"
+			expect(first.channel.client.delegate.pool.size).to be == 1
+		end
+		
+		it "keeps the shared client open when a stub closes" do
+			first = subject.new(bound_url, :this_channel_is_insecure)
+			expect(echo(first, "first")).to be == "first"
+			first.close
+			
+			second = subject.new(bound_url, :this_channel_is_insecure)
+			expect(echo(second, "second")).to be == "second"
+			expect(second.channel.client.delegate.pool.size).to be == 1
+		end
+		
+		it "closes the current thread's shared clients" do
+			shared = subject.new(bound_url, :this_channel_is_insecure)
+			expect(echo(shared, "before")).to be == "before"
+			client = shared.channel.client
+			expect(client.delegate.pool.size).to be == 1
+			
+			Async::GRPC::Compatible::SharedChannel.close
+			
+			expect(client.delegate.pool.size).to be == 0
+			expect(shared.channel.client).not.to be_equal(client)
+			expect(echo(shared, "after")).to be == "after"
+		end
+		
+		it "uses a separate client on each thread" do
+			shared = subject.new(bound_url, :this_channel_is_insecure)
+			other = Thread.new{shared.channel.client}.value
+			
+			expect(other).not.to be_equal(shared.channel.client)
+			expect(Thread.new{shared.channel.client}.value).not.to be_equal(other)
+		end
+		
+		it "uses an owned client for a local subchannel pool" do
+			shared = subject.new(bound_url, :this_channel_is_insecure)
+			local = subject.new(bound_url, :this_channel_is_insecure, channel_args: {"grpc.use_local_subchannel_pool" => 1})
+			
+			expect(local.channel).not.to be_a(Async::GRPC::Compatible::SharedChannel)
+			expect(local.channel.client).not.to be_equal(shared.channel.client)
+			expect(echo(local, "local")).to be == "local"
+			
+			expect(local.channel.client).to receive(:close)
+			local.close
+		end
+		
+		it "accepts a symbol key for the local subchannel pool" do
+			local = subject.new(bound_url, :this_channel_is_insecure, channel_args: {"grpc.use_local_subchannel_pool": 1})
+			
+			expect(local.channel).not.to be_a(Async::GRPC::Compatible::SharedChannel)
+		end
+		
+		it "shares the client when the local subchannel pool is disabled" do
+			shared = subject.new(bound_url, :this_channel_is_insecure)
+			disabled = subject.new(bound_url, :this_channel_is_insecure, channel_args: {"grpc.use_local_subchannel_pool" => 0})
+			
+			expect(disabled.channel.client).to be_equal(shared.channel.client)
+		end
+		
+		with "TLS" do
+			include TLSContext
+			
+			it "shares a client between equivalent TLS configurations" do
+				first = subject.new(bound_url, tls_credentials)
+				second = subject.new(bound_url, tls_credentials)
+				
+				expect(second.channel.client).to be_equal(first.channel.client)
+				expect(echo(first, "first")).to be == "first"
+				expect(echo(second, "second")).to be == "second"
+				expect(first.channel.client.delegate.pool.size).to be == 1
+			end
+			
+			it "does not share a client between different TLS configurations" do
+				trusted = subject.new(bound_url, tls_credentials)
+				untrusted = subject.new(bound_url, IO::Endpoint::TLS::Configuration.new)
+				
+				expect(untrusted.channel.client).not.to be_equal(trusted.channel.client)
+				expect(echo(trusted, "trusted")).to be == "trusted"
+				expect{echo(untrusted, "untrusted")}.to raise_exception(::GRPC::Unavailable, message: be =~ /certificate verify failed/).and(have_attributes(
+					cause: be_a(OpenSSL::SSL::SSLError)
+				))
+			end
+			
+			it "does not reuse a client after the caller changes its TLS configuration" do
+				credentials = tls_credentials
+				original = subject.new(bound_url, credentials)
+				expect(echo(original, "original")).to be == "original"
+				
+				replacement_authority = Object.new.extend(Sus::Fixtures::OpenSSL::CertificateAuthorityContext)
+				credentials.trust_store.certificates.replace([replacement_authority.certificate_authority_certificate.to_pem])
+				
+				expect(original.channel.endpoint.tls_configuration.trust_store.certificates).to be == tls_credentials.trust_store.certificates
+				expect(subject.new(bound_url, tls_credentials).channel.client).to be_equal(original.channel.client)
+				
+				replacement = subject.new(bound_url, credentials)
+				expect(replacement.channel.client).not.to be_equal(original.channel.client)
+				expect{echo(replacement, "replacement")}.to raise_exception(::GRPC::Unavailable, message: be =~ /certificate verify failed/).and(have_attributes(
+					cause: be_a(OpenSSL::SSL::SSLError)
+				))
+			end
+			
+			it "does not expose private keys when inspected" do
+				credentials = IO::Endpoint::TLS::Configuration.new(
+					trust_store: tls_credentials.trust_store,
+					certificate_chain: [certificate.to_pem], private_key: key.to_pem
+				)
+				identified = subject.new(bound_url, credentials)
+				identified.channel.client
+				private_key = key.to_pem.lines[1].chomp
+				
+				expect(identified.inspect).not.to be(:include?, private_key)
+				expect(Async::GRPC::Compatible::SharedChannel.clients.inspect).not.to be(:include?, private_key)
+			end
+			
+			it "does not share a client between different client certificates" do
+				anonymous = subject.new(bound_url, tls_credentials)
+				identified = subject.new(bound_url, IO::Endpoint::TLS::Configuration.new(
+					trust_store: tls_credentials.trust_store,
+					certificate_chain: [certificate.to_pem], private_key: key.to_pem
+				))
+				
+				expect(identified.channel.client).not.to be_equal(anonymous.channel.client)
+			end
+			
+			it "shares a client between GAPIC stubs" do
+				credentials = ->{Async::GRPC::Compatible::ChannelCredentials.new(certificate_authority_certificate.to_pem)}
+				first = Async::GRPC::Compatible::GapicServiceStub.new(GeneratedCompatibleService, endpoint: bound_url, credentials: credentials.call, logger: nil)
+				second = Async::GRPC::Compatible::GapicServiceStub.new(GeneratedCompatibleService, endpoint: bound_url, credentials: credentials.call, logger: nil)
+				
+				expect(first.call_rpc(:echo, CompatibleMessage.new("first")).value).to be == "first"
+				first.close
+				expect(second.call_rpc(:echo, CompatibleMessage.new("second")).value).to be == "second"
+				expect(second.grpc_stub.channel.client).to be_equal(first.grpc_stub.channel.client)
+				expect(second.grpc_stub.channel.client.delegate.pool.size).to be == 1
+			end
+		end
+	end
+	
 	it "does not block sibling fibers" do
 		client_stub = stub
 		events = []

@@ -2,7 +2,7 @@
 
 grpc-ruby compatible client interfaces backed by `async-grpc` and `async-http`.
 
-The gem is intended for generated clients which currently construct a `GRPC::ClientStub`, but need to make non-blocking calls inside an Async event loop. Connection reuse and HTTP/2 multiplexing remain the responsibility of `async-http`; this gem does not add a second connection pool.
+The gem is intended for generated clients which currently construct a `GRPC::ClientStub`, but need to make non-blocking calls inside an Async event loop. Connection pooling and HTTP/2 multiplexing remain the responsibility of `async-http`; stubs for the same target share its connection pool, as described in [Connection sharing](#connection-sharing).
 
 The gem depends on `grpc` for service definitions and error types. TLS configuration comes from `IO::Endpoint`, and requests use Async's connection pool.
 
@@ -48,6 +48,7 @@ The initial implementation supports:
   - Deferred unary operations using `return_op: true`.
   - Ruby credential updaters supplied through `call_credentials:`, `credentials:`, or a credential object with `updater_proc`.
   - Unary stub generation from `GRPC::GenericService` definitions.
+  - Connection sharing between stubs for the same target, with `grpc.use_local_subchannel_pool` to opt out.
 
 The following are not yet supported:
 
@@ -55,10 +56,27 @@ The following are not yet supported:
   - grpc-ruby interceptors.
   - Parent call propagation.
   - Native `GRPC::Core::ChannelCredentials`, `GRPC::Core::CallCredentials`, composed credentials, and native channel overrides. These are rejected because their TLS configuration and authentication callbacks cannot be recovered through Ruby's public API.
-  - grpc-ruby channel arguments beyond accepting the compatible constructor parameter.
+  - grpc-ruby channel arguments other than `grpc.use_local_subchannel_pool`.
   - Non-DNS resolvers such as Unix sockets and xDS.
 
 Invalid HTTP responses become `GRPC::BadStatus` subclasses using the HTTP status mapping. The error details describe the invalid HTTP status and content type, and `error.cause` is an `Async::GRPC::ResponseError` whose `response` exposes the HTTP status, headers, and buffered body. Call `error.cause.response.read` to read that body.
+
+## Connection sharing
+
+Stubs constructed without a channel override share connections, similar to grpc-core's global subchannel pool. Stubs on the same thread use one `Async::GRPC::Client` when they connect to the same target with the same TLS configuration. TLS configurations are compared by value, so separately constructed but identical configurations share a client, and different trust roots, client certificates, or verification policies never do. Constructing a stub or GAPIC client per request or per job therefore reuses warm connections within the same Async reactor instead of performing a new TLS and HTTP/2 handshake.
+
+Each thread has its own shared client, because an Async connection pool belongs to a single reactor. The client is selected when each call runs, so a stub shared between threads uses the calling thread's connections. Connections do not outlive their reactor. Calls made outside a reactor each run in a temporary reactor, so run related calls inside one `Sync` or `Async` block to reuse connections.
+
+Closing a stub leaves shared clients open for other stubs. Call `Async::GRPC::Compatible::SharedChannel.close` to close the current thread's shared clients, for example when a worker thread shuts down; later calls open new clients. To give a stub a connection pool of its own, which `close` releases, set grpc's local subchannel pool argument:
+
+``` ruby
+stub = Async::GRPC::Compatible::ClientStub.new(
+	"grpc.example.com:443", IO::Endpoint::TLS::Configuration.new,
+	channel_args: {"grpc.use_local_subchannel_pool" => 1}
+)
+```
+
+Pass `channel_override:` (or `channel:` to `GapicServiceStub`) to control connection reuse explicitly. The caller owns a channel supplied this way. Shared channels are built from the target URL and TLS configuration alone, so subclasses which override `ClientStub.endpoint_for`, for example to connect through a custom transport, only take effect with a local subchannel pool; alternatively, pass `channel_override: Async::GRPC::Compatible::Channel.new(endpoint)`.
 
 ## Operations and credentials
 
@@ -154,7 +172,7 @@ Sync do
 end
 ```
 
-For an existing Async connection pool, pass `channel:` to the adapter. The caller owns that channel. GAPIC native channel pools are unsupported because Async::HTTP already manages connections.
+Without `channel:`, adapters share connections as described in [Connection sharing](#connection-sharing). For an existing Async connection pool, pass `channel:` to the adapter. The caller owns that channel. GAPIC native channel pools are unsupported because Async::HTTP already manages connections.
 
 Generated high-level Google clients construct `Gapic::ServiceStub` inside their constructors. Applications adapting those constructors can use `GapicServiceStub.new(Service, credentials: original_credentials, ...)` at that construction point. The adapter can also be called directly, as above, without replacing global GRPC constants. Keep the original Ruby credentials available at this boundary; credentials already composed into `GRPC::Core::ChannelCredentials` cannot be recovered.
 

@@ -24,6 +24,6 @@ Gem::Specification.new do |specification|
 	specification.add_dependency "async-grpc", "~> 0.10"
 	specification.add_dependency "async-http", "~> 0.100"
 	specification.add_dependency "grpc"
-	specification.add_dependency "io-endpoint", "~> 0.18"
+	specification.add_dependency "io-endpoint", "~> 0.19"
 	specification.add_dependency "protocol-grpc", "~> 0.17"
 end
