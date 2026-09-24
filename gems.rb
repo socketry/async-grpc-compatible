@@ -7,15 +7,12 @@ source "https://rubygems.org"
 
 gemspec
 
-# Use the shared fixes while their releases are pending:
-gem "protocol-grpc", git: "https://github.com/socketry/protocol-grpc.git", ref: "4a35b7cdb9d88e64794d2cf05ba72d9de1140aa9"
-
 local_async_grpc_path = File.expand_path("../async-grpc", __dir__)
 
 if File.directory?(local_async_grpc_path)
 	gem "async-grpc", path: local_async_grpc_path
 else
-	gem "async-grpc", git: "https://github.com/socketry/async-grpc.git", ref: "f1f7ff58487e3f79dffd1481ce1665796c6b69db"
+	gem "async-grpc", git: "https://github.com/socketry/async-grpc.git", ref: "2b31bf4d62917263d9d8f99bcc135079565e056a"
 end
 
 group :maintenance, optional: true do
