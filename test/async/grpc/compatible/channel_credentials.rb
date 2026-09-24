@@ -14,8 +14,9 @@ describe Async::GRPC::Compatible::ChannelCredentials do
 	let(:private_key) {key.to_pem}
 	
 	it "uses the default trust store with peer verification when no roots are supplied" do
-		configuration = subject.new.tls_configuration
+		configuration = subject.new
 		
+		expect(configuration).to be_a(IO::Endpoint::TLS::Configuration)
 		expect(configuration.trust_store).to be_nil
 		expect(configuration.certificate_chain).to be_nil
 		expect(configuration.private_key).to be_nil
@@ -23,7 +24,7 @@ describe Async::GRPC::Compatible::ChannelCredentials do
 	end
 	
 	it "maps gRPC positional arguments and preserves certificate bundle ordering" do
-		configuration = subject.new(roots + certificate.to_pem, private_key, chain).tls_configuration
+		configuration = subject.new(roots + certificate.to_pem, private_key, chain)
 		
 		expect(configuration.trust_store.certificates).to be == [roots.strip, certificate.to_pem.strip]
 		expect(configuration.trust_store.system_certificates?).to be == false
@@ -33,7 +34,7 @@ describe Async::GRPC::Compatible::ChannelCredentials do
 	end
 	
 	it "allows a client identity with the default trust store" do
-		configuration = subject.new(nil, private_key, chain).tls_configuration
+		configuration = subject.new(nil, private_key, chain)
 		
 		expect(configuration.trust_store).to be_nil
 		expect(configuration.certificate_chain).to be == [certificate.to_pem.strip, roots.strip]
