@@ -36,7 +36,7 @@ module Async
 				
 				# Async::HTTP owns connection pooling; native GAPIC channel pools are unsupported.
 				def create_channel_pool(...)
-					raise ArgumentError, "Use a shared Async channel instead of a GAPIC channel pool"
+					raise ArgumentError, "Use a shared Async channel instead of a GAPIC channel pool!"
 				end
 				
 				# Close the underlying stub's owned connection pool.

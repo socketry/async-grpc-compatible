@@ -42,21 +42,21 @@ module Async
 				# @raises [GRPC::BadStatus] If the RPC fails or is cancelled.
 				def execute
 					@mutex.synchronize do
-						raise RuntimeError, "Operation has already been executed" if @executed
+						raise RuntimeError, "Operation has already been executed!" if @executed
 						@executed = true
 					end
 					
 					begin
 						Sync do |parent|
 							task = @mutex.synchronize do
-								raise ::GRPC::Cancelled.new("Cancelled") if @cancelled
+								raise ::GRPC::Cancelled.new("Cancelled!") if @cancelled
 								@thread = Thread.current
 								@task = Async::Task.new(parent, finished: false){@execute.call(self)}
 							end
 							
 							task.run
 							result = task.wait
-							raise ::GRPC::Cancelled.new("Cancelled") if cancelled?
+							raise ::GRPC::Cancelled.new("Cancelled!") if cancelled?
 							result
 						ensure
 							task&.stop
@@ -77,7 +77,7 @@ module Async
 				def cancel
 					task = @mutex.synchronize do
 						return if @finished
-						raise ThreadError, "Cancel the operation from its reactor thread" if @task && @thread != Thread.current
+						raise ThreadError, "Cancel the operation from its reactor thread!" if @task && @thread != Thread.current
 						@cancelled = true
 						@task
 					end
