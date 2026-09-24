@@ -58,7 +58,7 @@ The following are not yet supported:
   - grpc-ruby channel arguments beyond accepting the compatible constructor parameter.
   - Non-DNS resolvers such as Unix sockets and xDS.
 
-Invalid HTTP responses become `GRPC::BadStatus` subclasses using the HTTP status mapping. The error details include the response body, and `error.cause` is an `Async::GRPC::ResponseError` whose `response` exposes the HTTP status and headers.
+Invalid HTTP responses become `GRPC::BadStatus` subclasses using the HTTP status mapping. The error details describe the invalid HTTP status and content type, and `error.cause` is an `Async::GRPC::ResponseError` whose `response` exposes the HTTP status, headers, and buffered body. Call `error.cause.response.read` to read that body.
 
 Socket and TLS failures can still raise native Ruby exceptions. Translation into grpc-ruby transport errors is tracked separately in [issue #5](https://github.com/socketry/async-grpc-compatible/issues/5).
 
