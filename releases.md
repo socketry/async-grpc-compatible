@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+  - Require `async-grpc ~> 0.10` for HTTP response validation and buffered error responses.
   - Send `application/grpc` and use shared metadata decoding, including unpadded binary metadata.
   - Map invalid HTTP responses to grpc-ruby errors, preserving the native `ResponseError` and its buffered response as the cause.
   - Support deferred unary operations with execution, cancellation, deadline, status, and response metadata access.

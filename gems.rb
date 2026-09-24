@@ -11,8 +11,6 @@ local_async_grpc_path = File.expand_path("../async-grpc", __dir__)
 
 if File.directory?(local_async_grpc_path)
 	gem "async-grpc", path: local_async_grpc_path
-else
-	gem "async-grpc", git: "https://github.com/socketry/async-grpc.git", ref: "90623d0037aa7d5ae109cc79f72a57620e663577"
 end
 
 group :maintenance, optional: true do
